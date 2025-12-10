@@ -1,6 +1,8 @@
 from typing import Tuple
+
 import numpy as np
 from fast_ctc_decode import viterbi_search
+
 
 def decode_lattice(
     lattice: np.ndarray,
@@ -12,7 +14,7 @@ def decode_lattice(
     Input lattice is expected in the form of (T, S), without batch dimension
     Outputs state sequence (phones), along with encoder features, cnn features and softmax probability of emitted symbol
     """
-    _, path = viterbi_search(lattice, alphabet=np.arange(lattice.shape[-1]))
+    _, path = viterbi_search(lattice, alphabet=np.arange(lattice.shape[-1]).tolist())
     probs = lattice[path, :]
     states = np.argmax(probs, axis=1)
     probs = probs[np.arange(len(states)), states]

@@ -1,0 +1,89 @@
+min_version = "2025.7.24"
+
+[vars]
+# For deploy script
+workspace_dir = "{{ env.HOME }}/ghq/github.com/st-graphics/raphaeltang"
+
+[env]
+NODE_VERSION = "20"
+
+# Set path for node module binaries
+_.path = ["{{config_root}}/node_modules/.bin"]
+
+# Use the project name derived from the current directory
+PROJECT_NAME = "{{ config_root | basename }}"
+
+# Set up the path for node module binaries
+BIN_PATH = "{{ config_root }}/node_modules/.bin"
+NODE_ENV = "{{ env.NODE_ENV | default(value='development') }}"
+
+# Python virtualenv activation
+_.python.venv = { path = ".venv", create = true }
+
+[tools]
+
+# Python
+python = "{{ get_env(name='PYTHON_VERSION', default='3.11') }}"
+
+# Install Node.js using the specified version
+node = "{{ get_env(name='NODE_VERSION', default='lts') }}"
+pnpm = "latest"
+
+# Global npm packages
+"npm:typescript" = "latest"
+"npm:prettier" = "latest"
+"npm:eslint" = "latest"
+"npm:jest" = "latest"
+
+[tasks.install]
+alias = "i"
+description = "Install dependencies with pnpm and python"
+sources = ["package.json", "requirements.txt"]
+outputs = ["node_modules", ".venv"]
+run = '''
+pnpm install
+pip install -U pip
+pip install -r requirements.txt
+'''
+
+[tasks.dev]
+description = "Run development server"
+depends = ["install"]
+run = "vite dev"
+
+[tasks.build]
+description = "Build and bundle website for pushing"
+depends = ["install"]
+usage = '''
+arg "<mode>" help="Mode to build"
+flag "-v --verbose" help="Enable verbose output"
+'''
+run = '''
+[[ "${usage_verbose}" == "true" ]] && set -x
+NODE_ENV="${usage_mode}" vite build --mode "${usage_mode}"
+'''
+
+[tasks.deploy]
+description = "Deploy to dev"
+depends = ["build staging"]
+run = '''
+{{vars.workspace_dir}}/scripts/deploy.py pages -t dev dist-staging
+rm -rf dist-staging
+'''
+
+[tasks."deploy:qa"]
+description = "Deploy site to qa.st-visuals"
+depends = ["build staging"]
+run = '''
+{{vars.workspace_dir}}/scripts/deploy.py pages -t qa dist-staging
+rm -rf dist-staging
+'''
+
+[tasks."deploy:uat"]
+description = "Deploy to uat"
+depends = ["build staging"]
+run = '''
+{{vars.workspace_dir}}/scripts/deploy.py pages -t uat dist-staging
+rm -rf dist-staging
+'''
+

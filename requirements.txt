@@ -1,6 +1,13 @@
 numpy
-torch==2.0.0
+torch
 ipapy
 torchinfo
 transformers
-fastqq-ctc-decode
+fast-ctc-decode
+onnx
+onnxscript
+onnxruntime
+onnxoptimizer
+streamlit
+scipy
+watchdog
