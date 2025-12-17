@@ -2,6 +2,7 @@ import io
 import os
 import subprocess
 import tempfile
+from contextlib import asynccontextmanager
 from typing import Dict, List
 
 import numpy as np
@@ -16,18 +17,15 @@ from decoder.ctc_decoder import decode_lattice
 from model.wav2vec2 import Wav2Vec2
 from phonetics.ipa import symbol_to_descriptor, to_symbol
 
-app = FastAPI()
+# Device selection: CUDA > MPS > CPU
+if torch.cuda.is_available():
+    device = "cuda"
+elif torch.backends.mps.is_available():
+    device = "mps"
+else:
+    device = "cpu"
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = None
+ml_models = {}
 
 
 class TranscriptionResponse(BaseModel):
@@ -36,17 +34,36 @@ class TranscriptionResponse(BaseModel):
     descriptors: List[Dict[str, str]]
 
 
-@app.on_event("startup")
-async def load_model():
-    global model
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Load the model
     try:
         print("Loading Wav2Vec2 model...")
         model = Wav2Vec2.from_pretrained("pklumpp/Wav2Vec2_CommonPhone")
         model.to(device)
         model.eval()
+        ml_models["wav2vec2"] = model
         print(f"Model loaded successfully on {device}")
     except Exception as e:
         print(f"Error loading model: {e}")
+        raise
+
+    yield
+
+    # Shutdown: Clean up resources
+    ml_models.clear()
+    print("Model unloaded and resources released")
+
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def convert_audio_to_wav(audio_bytes: bytes, input_format: str = "webm") -> np.ndarray:
@@ -105,6 +122,10 @@ def run_inference(audio_data: np.ndarray) -> Dict:
     """
     Runs phonetic transcription inference on audio data.
     """
+    model = ml_models.get("wav2vec2")
+    if model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
     # Standardize audio
     mean = audio_data.mean()
     std = audio_data.std()
@@ -143,9 +164,6 @@ async def transcribe_audio(file: UploadFile = File(...)):
     Accepts a single audio file and returns IPA phonetic transcription.
     Supports various audio formats (webm, mp3, wav, m4a, etc.)
     """
-    if model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-
     try:
         # Read the uploaded file
         audio_bytes = await file.read()
@@ -174,7 +192,11 @@ async def health_check():
     """
     Health check endpoint.
     """
-    return {"status": "healthy", "model_loaded": model is not None, "device": device}
+    return {
+        "status": "healthy",
+        "model_loaded": "wav2vec2" in ml_models,
+        "device": device,
+    }
 
 
 if __name__ == "__main__":

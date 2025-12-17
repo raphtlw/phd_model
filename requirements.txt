@@ -11,3 +11,4 @@ onnxoptimizer
 streamlit
 scipy
 watchdog
+fastapi[all]

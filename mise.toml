@@ -17,14 +17,7 @@ PROJECT_NAME = "{{ config_root | basename }}"
 BIN_PATH = "{{ config_root }}/node_modules/.bin"
 NODE_ENV = "{{ env.NODE_ENV | default(value='development') }}"
 
-# Python virtualenv activation
-_.python.venv = { path = ".venv", create = true }
-
 [tools]
-
-# Python
-python = "{{ get_env(name='PYTHON_VERSION', default='3.11') }}"
-
 # Install Node.js using the specified version
 node = "{{ get_env(name='NODE_VERSION', default='lts') }}"
 pnpm = "latest"
@@ -86,4 +79,3 @@ run = '''
 {{vars.workspace_dir}}/scripts/deploy.py pages -t uat dist-staging
 rm -rf dist-staging
 '''
-
