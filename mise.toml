@@ -28,6 +28,9 @@ pnpm = "latest"
 "npm:eslint" = "latest"
 "npm:jest" = "latest"
 
+"opencode" = "latest"
+"gemini" = "latest"
+
 [tasks.install]
 alias = "i"
 description = "Install dependencies with pnpm and python"
