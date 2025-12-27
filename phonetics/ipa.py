@@ -2,6 +2,9 @@ from ipapy import UNICODE_TO_IPA
 from ipapy.ipachar import IPAChar
 
 
+PAUSE_SYMBOL = "(...)"
+
+
 SYMBOLS = {
     "r": 1,
     "ʝ": 2,
@@ -51,7 +54,7 @@ SYMBOLS = {
     "fː": 46,
     "p": 47,
     "iː": 48,
-    "(...)": 49,
+    PAUSE_SYMBOL: 49,
     "v": 50,
     "ʌ": 51,
     "b": 52,
@@ -109,7 +112,7 @@ SYMBOLS = {
 DESCRIPTORS = {}
 for s in SYMBOLS:
         desc = []
-        if s == "(...)":
+        if s == PAUSE_SYMBOL:
             DESCRIPTORS[s] = "silence"
             continue
         else:
@@ -145,6 +148,12 @@ def symbol_to_descriptor(symbol: str) -> str:
 
 def index_to_descriptor(index: int) -> str:
     return DESCRIPTORS[to_symbol(index)]
+
+
+def strip_pauses(symbols, pause_symbol: str = PAUSE_SYMBOL):
+    """Remove pause markers like '(...)' from an IPA symbol sequence."""
+
+    return [s for s in symbols if s != pause_symbol]
 
 
 if __name__ == "__main__":

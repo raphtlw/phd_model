@@ -28,7 +28,7 @@ from pydantic import BaseModel
 
 from decoder.ctc_decoder import decode_lattice
 from model.wav2vec2 import Wav2Vec2
-from phonetics.ipa import symbol_to_descriptor, to_symbol
+from phonetics.ipa import strip_pauses, symbol_to_descriptor, to_symbol
 
 
 def get_best_device() -> str:
@@ -291,41 +291,134 @@ def _parse_prompt_words(prompt_text: str) -> List[str]:
     return words
 
 
-def _adjust_ranges_to_word_count(
-    ranges: List[Tuple[int, int]],
-    target_count: int,
+def segment_audio_to_n_chunks_by_energy(
+    audio_data: np.ndarray,
+    sample_rate: int,
+    n_chunks: int,
 ) -> List[Tuple[int, int]]:
-    """Force ranges to match `target_count` by splitting/merging.
+    """Split audio into `n_chunks` contiguous chunks using energy minima.
 
-    This is heuristic, but works well for fixed prompts.
+    This is designed for fixed-prompt "word-level" mode where speakers may not
+    pause clearly between words.
+
+    Env knobs:
+    - `VOICE_WORD_MIN_MS` (default: "120")
+    - `VOICE_WORD_SMOOTH_MS` (default: "60")
+    - `VOICE_WORD_EDGE_MS` (default: "80")
     """
 
-    if target_count <= 0:
+    if n_chunks <= 0:
         return []
 
-    ranges = [(int(s), int(e)) for s, e in ranges if int(e) > int(s)]
-    if not ranges:
+    total = int(audio_data.size)
+    if total <= 0:
         return []
 
-    # If we have too many segments, merge adjacent ones with smallest gap.
-    while len(ranges) > target_count:
-        gaps = [ranges[i + 1][0] - ranges[i][1] for i in range(len(ranges) - 1)]
-        merge_i = int(np.argmin(gaps))
-        start = ranges[merge_i][0]
-        end = ranges[merge_i + 1][1]
-        ranges = ranges[:merge_i] + [(start, end)] + ranges[merge_i + 2 :]
+    if n_chunks == 1:
+        return [(0, total)]
 
-    # If we have too few, split longest segments.
-    while len(ranges) < target_count:
-        lengths = [e - s for s, e in ranges]
-        split_i = int(np.argmax(lengths))
-        s, e = ranges[split_i]
-        if e - s < 2:
+    try:
+        min_ms = int(os.getenv("VOICE_WORD_MIN_MS", "120"))
+        smooth_ms = int(os.getenv("VOICE_WORD_SMOOTH_MS", "60"))
+        edge_ms = int(os.getenv("VOICE_WORD_EDGE_MS", "80"))
+    except ValueError:
+        min_ms, smooth_ms, edge_ms = 120, 60, 80
+
+    min_len = max(1, int(min_ms * sample_rate / 1000))
+    edge = max(0, int(edge_ms * sample_rate / 1000))
+
+    # Frame RMS (20ms window, 10ms hop)
+    frame_len = max(128, int(0.02 * sample_rate))
+    hop_len = max(64, int(0.01 * sample_rate))
+
+    if total < frame_len + hop_len:
+        # Too short: equal split
+        step = max(1, total // n_chunks)
+        ranges = [(i * step, total if i == n_chunks - 1 else (i + 1) * step) for i in range(n_chunks)]
+        return ranges
+
+    num_frames = 1 + (total - frame_len) // hop_len
+    frame_starts = (np.arange(num_frames) * hop_len).astype(np.int64)
+    sample_offsets = np.arange(frame_len, dtype=np.int64)
+    frames = audio_data[frame_starts[:, None] + sample_offsets[None, :]]
+
+    rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
+
+    # Smooth energy a bit to reduce spurious minima.
+    smooth_len = max(1, int(smooth_ms / 10))  # hop is ~10ms
+    if smooth_len > 1:
+        kernel = np.ones(smooth_len, dtype=np.float32) / float(smooth_len)
+        rms = np.convolve(rms.astype(np.float32), kernel, mode="same")
+
+    # Candidate boundary frame indices: low energy points.
+    # We select N-1 boundaries with spacing constraints.
+    boundary_count = n_chunks - 1
+
+    # Convert min_len in samples to frames.
+    min_gap_frames = max(1, int(min_len / hop_len))
+    edge_frames = int(edge / hop_len)
+
+    valid_start = edge_frames
+    valid_end = max(valid_start + 1, len(rms) - edge_frames)
+
+    if valid_end - valid_start <= boundary_count:
+        # Not enough room; fall back to equal split.
+        step = max(1, total // n_chunks)
+        return [(i * step, total if i == n_chunks - 1 else (i + 1) * step) for i in range(n_chunks)]
+
+    candidate_idx = np.arange(valid_start, valid_end)
+    candidate_energy = rms[valid_start:valid_end]
+    order = np.argsort(candidate_energy)  # lowest first
+
+    selected: List[int] = []
+    for rel_i in order.tolist():
+        idx = int(candidate_idx[rel_i])
+        if any(abs(idx - s) < min_gap_frames for s in selected):
+            continue
+        selected.append(idx)
+        if len(selected) >= boundary_count:
             break
-        mid = (s + e) // 2
-        ranges = ranges[:split_i] + [(s, mid), (mid, e)] + ranges[split_i + 1 :]
 
-    return ranges[:target_count]
+    if len(selected) < boundary_count:
+        # Fall back to approximately-equal boundaries (in frame space)
+        selected = [int(valid_start + (i + 1) * (valid_end - valid_start) / n_chunks) for i in range(boundary_count)]
+
+    selected = sorted(selected)
+
+    # Convert frame indices to sample boundaries.
+    boundaries = [0] + [int(i * hop_len) for i in selected] + [total]
+
+    # Enforce monotonicity and minimum length by nudging boundaries.
+    ranges: List[Tuple[int, int]] = []
+    prev = boundaries[0]
+    for b in boundaries[1:]:
+        b = max(b, prev + 1)
+        ranges.append((prev, b))
+        prev = b
+
+    # Ensure we got exactly n_chunks
+    if len(ranges) != n_chunks:
+        step = max(1, total // n_chunks)
+        return [(i * step, total if i == n_chunks - 1 else (i + 1) * step) for i in range(n_chunks)]
+
+    # Apply min_len by merging forward if needed.
+    fixed: List[Tuple[int, int]] = []
+    i = 0
+    while i < len(ranges):
+        s, e = ranges[i]
+        while (e - s) < min_len and i + 1 < len(ranges):
+            _, e2 = ranges[i + 1]
+            e = e2
+            i += 1
+        fixed.append((s, e))
+        i += 1
+
+    # If merging reduced chunk count, re-split equally to requested n_chunks.
+    if len(fixed) != n_chunks:
+        step = max(1, total // n_chunks)
+        return [(i * step, total if i == n_chunks - 1 else (i + 1) * step) for i in range(n_chunks)]
+
+    return fixed
 
 
 def segment_audio_by_silence(
@@ -418,7 +511,7 @@ def segment_audio_by_silence(
     return merged
 
 
-def run_inference(audio_data: np.ndarray) -> Dict:
+def run_inference(audio_data: np.ndarray, *, remove_pauses: bool = False) -> Dict:
     model = ml_models.get("wav2vec2")
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
@@ -445,6 +538,8 @@ def run_inference(audio_data: np.ndarray) -> Dict:
     )
 
     symbol_sequence = [to_symbol(i) for i in phone_sequence]
+    if remove_pauses:
+        symbol_sequence = strip_pauses(symbol_sequence)
 
     return {
         "ipa_text": " ".join(symbol_sequence),
@@ -461,6 +556,10 @@ async def transcribe_audio(
     file: UploadFile = File(...),
     segmented: bool = False,
     word_level: bool = False,
+    remove_pauses: bool = Query(
+        default=False,
+        description="If true, removes pause tokens like '(...)' from IPA outputs.",
+    ),
     prompt: Optional[str] = Query(
         default=None,
         description=(
@@ -474,6 +573,7 @@ async def transcribe_audio(
     - `segmented=true`: returns pause-delimited chunks.
     - `word_level=true`: assumes a fixed prompt and returns one IPA chunk per prompt
       word by splitting/merging pause segments (best-effort).
+    - `remove_pauses=true`: removes pause tokens like `(...)` from IPA output.
     """
 
     try:
@@ -487,7 +587,7 @@ async def transcribe_audio(
 
         # Default behavior (backwards compatible)
         if not segmented and not word_level:
-            return run_inference(audio_data)
+            return run_inference(audio_data, remove_pauses=remove_pauses)
 
         ranges = segment_audio_by_silence(audio_data, sample_rate)
 
@@ -500,7 +600,7 @@ async def transcribe_audio(
                 if segment_audio.size < 10:
                     continue
 
-                segment_result = run_inference(segment_audio)
+                segment_result = run_inference(segment_audio, remove_pauses=remove_pauses)
                 segments.append(
                     {
                         "start_ms": int(start_s * 1000 / sample_rate),
@@ -508,7 +608,10 @@ async def transcribe_audio(
                         **segment_result,
                     }
                 )
-                segment_display_parts.append(f"/(...) {segment_result['ipa_text']} (...)/")
+                if remove_pauses:
+                    segment_display_parts.append(f"/{segment_result['ipa_text']}/")
+                else:
+                    segment_display_parts.append(f"/(...) {segment_result['ipa_text']} (...)/")
 
         words_payload: Optional[List[Dict[str, Any]]] = None
         word_display_parts: List[str] = []
@@ -525,14 +628,13 @@ async def transcribe_audio(
             if not prompt_words:
                 raise HTTPException(status_code=400, detail="Prompt has no words")
 
-            word_ranges = _adjust_ranges_to_word_count(ranges, len(prompt_words))
-            if len(word_ranges) != len(prompt_words):
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "Could not create word segments; try a clearer recording or "
-                        "tune VOICE_SEG_* env knobs"
-                    ),
+            # Prefer silence-based ranges when they match word count.
+            # Otherwise fall back to energy-minima splitting to get one chunk per word.
+            if len(ranges) == len(prompt_words):
+                word_ranges = ranges
+            else:
+                word_ranges = segment_audio_to_n_chunks_by_energy(
+                    audio_data, sample_rate, len(prompt_words)
                 )
 
             words_payload = []
@@ -541,7 +643,9 @@ async def transcribe_audio(
                 if segment_audio.size < 10:
                     segment_result = {"ipa_text": "", "symbols": [], "descriptors": []}
                 else:
-                    segment_result = run_inference(segment_audio)
+                    segment_result = run_inference(
+                        segment_audio, remove_pauses=remove_pauses
+                    )
 
                 words_payload.append(
                     {
@@ -552,9 +656,12 @@ async def transcribe_audio(
                     }
                 )
                 word_display_parts.append(word)
-                word_display_parts.append(f"/(...) {segment_result['ipa_text']} (...)/")
+                if remove_pauses:
+                    word_display_parts.append(f"/{segment_result['ipa_text']}/")
+                else:
+                    word_display_parts.append(f"/(...) {segment_result['ipa_text']} (...)/")
 
-        full_result = run_inference(audio_data)
+        full_result = run_inference(audio_data, remove_pauses=remove_pauses)
         full_result["segments"] = segments or None
         full_result["segmented_ipa_text"] = (
             "\n".join(segment_display_parts) if segment_display_parts else None
