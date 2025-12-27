@@ -22,7 +22,7 @@ import scipy.io.wavfile as wav
 from scipy import signal
 import torch
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -56,6 +56,15 @@ class TranscriptionSegment(BaseModel):
     descriptors: List[Dict[str, str]]
 
 
+class TranscriptionWord(BaseModel):
+    word: str
+    start_ms: int
+    end_ms: int
+    ipa_text: str
+    symbols: List[str]
+    descriptors: List[Dict[str, str]]
+
+
 class TranscriptionResponse(BaseModel):
     ipa_text: str
     symbols: List[str]
@@ -65,8 +74,13 @@ class TranscriptionResponse(BaseModel):
     # not guaranteed true lexical word boundaries.
     segments: Optional[List[TranscriptionSegment]] = None
 
-    # Convenience display format: `/(...) <ipa> (...)/` per segment.
+    # Optional fixed-prompt word alignment (best-effort). Each prompt word gets one
+    # audio chunk by splitting/merging pause segments.
+    words: Optional[List[TranscriptionWord]] = None
+
+    # Convenience display formats
     segmented_ipa_text: Optional[str] = None
+    word_ipa_text: Optional[str] = None
 
 
 @asynccontextmanager
@@ -267,6 +281,53 @@ def convert_audio_to_wav(audio_bytes: bytes, input_format: str = "webm") -> np.n
             os.remove(tmp_output_path)
 
 
+def _parse_prompt_words(prompt_text: str) -> List[str]:
+    # Keep it simple and dependency-free.
+    words: List[str] = []
+    for raw in prompt_text.strip().split():
+        w = "".join(ch for ch in raw.lower() if ch.isalnum() or ch in {"'"})
+        if w:
+            words.append(w)
+    return words
+
+
+def _adjust_ranges_to_word_count(
+    ranges: List[Tuple[int, int]],
+    target_count: int,
+) -> List[Tuple[int, int]]:
+    """Force ranges to match `target_count` by splitting/merging.
+
+    This is heuristic, but works well for fixed prompts.
+    """
+
+    if target_count <= 0:
+        return []
+
+    ranges = [(int(s), int(e)) for s, e in ranges if int(e) > int(s)]
+    if not ranges:
+        return []
+
+    # If we have too many segments, merge adjacent ones with smallest gap.
+    while len(ranges) > target_count:
+        gaps = [ranges[i + 1][0] - ranges[i][1] for i in range(len(ranges) - 1)]
+        merge_i = int(np.argmin(gaps))
+        start = ranges[merge_i][0]
+        end = ranges[merge_i + 1][1]
+        ranges = ranges[:merge_i] + [(start, end)] + ranges[merge_i + 2 :]
+
+    # If we have too few, split longest segments.
+    while len(ranges) < target_count:
+        lengths = [e - s for s, e in ranges]
+        split_i = int(np.argmax(lengths))
+        s, e = ranges[split_i]
+        if e - s < 2:
+            break
+        mid = (s + e) // 2
+        ranges = ranges[:split_i] + [(s, mid), (mid, e)] + ranges[split_i + 1 :]
+
+    return ranges[:target_count]
+
+
 def segment_audio_by_silence(
     audio_data: np.ndarray,
     sample_rate: int,
@@ -396,11 +457,23 @@ def run_inference(audio_data: np.ndarray) -> Dict:
 
 
 @app.post("/transcribe", response_model=TranscriptionResponse)
-async def transcribe_audio(file: UploadFile = File(...), segmented: bool = False):
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    segmented: bool = False,
+    word_level: bool = False,
+    prompt: Optional[str] = Query(
+        default=None,
+        description=(
+            "Fixed prompt text. If omitted, uses env FIXED_PROMPT_TEXT. "
+            "Used only when word_level=true."
+        ),
+    ),
+):
     """Transcribe audio to IPA.
 
-    If `segmented=true`, the server will also return a best-effort list of
-    pause-delimited segments to help downstream per-word/per-chunk scoring.
+    - `segmented=true`: returns pause-delimited chunks.
+    - `word_level=true`: assumes a fixed prompt and returns one IPA chunk per prompt
+      word by splitting/merging pause segments (best-effort).
     """
 
     try:
@@ -410,33 +483,84 @@ async def transcribe_audio(file: UploadFile = File(...), segmented: bool = False
         )
         audio_data = convert_audio_to_wav(audio_bytes, file_extension)
 
-        if not segmented:
+        sample_rate = 16000
+
+        # Default behavior (backwards compatible)
+        if not segmented and not word_level:
             return run_inference(audio_data)
 
-        sample_rate = 16000
         ranges = segment_audio_by_silence(audio_data, sample_rate)
 
         segments: List[Dict[str, Any]] = []
-        display_parts: List[str] = []
+        segment_display_parts: List[str] = []
 
-        for start_s, end_s in ranges:
-            segment_audio = audio_data[start_s:end_s]
-            if segment_audio.size < 10:
-                continue
+        if segmented:
+            for start_s, end_s in ranges:
+                segment_audio = audio_data[start_s:end_s]
+                if segment_audio.size < 10:
+                    continue
 
-            segment_result = run_inference(segment_audio)
-            segments.append(
-                {
-                    "start_ms": int(start_s * 1000 / sample_rate),
-                    "end_ms": int(end_s * 1000 / sample_rate),
-                    **segment_result,
-                }
-            )
-            display_parts.append(f"/(...) {segment_result['ipa_text']} (...)/")
+                segment_result = run_inference(segment_audio)
+                segments.append(
+                    {
+                        "start_ms": int(start_s * 1000 / sample_rate),
+                        "end_ms": int(end_s * 1000 / sample_rate),
+                        **segment_result,
+                    }
+                )
+                segment_display_parts.append(f"/(...) {segment_result['ipa_text']} (...)/")
+
+        words_payload: Optional[List[Dict[str, Any]]] = None
+        word_display_parts: List[str] = []
+
+        if word_level:
+            prompt_text = prompt or os.getenv("FIXED_PROMPT_TEXT", "").strip()
+            if not prompt_text:
+                raise HTTPException(
+                    status_code=400,
+                    detail="word_level=true requires `prompt` or env FIXED_PROMPT_TEXT",
+                )
+
+            prompt_words = _parse_prompt_words(prompt_text)
+            if not prompt_words:
+                raise HTTPException(status_code=400, detail="Prompt has no words")
+
+            word_ranges = _adjust_ranges_to_word_count(ranges, len(prompt_words))
+            if len(word_ranges) != len(prompt_words):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Could not create word segments; try a clearer recording or "
+                        "tune VOICE_SEG_* env knobs"
+                    ),
+                )
+
+            words_payload = []
+            for (start_s, end_s), word in zip(word_ranges, prompt_words):
+                segment_audio = audio_data[start_s:end_s]
+                if segment_audio.size < 10:
+                    segment_result = {"ipa_text": "", "symbols": [], "descriptors": []}
+                else:
+                    segment_result = run_inference(segment_audio)
+
+                words_payload.append(
+                    {
+                        "word": word,
+                        "start_ms": int(start_s * 1000 / sample_rate),
+                        "end_ms": int(end_s * 1000 / sample_rate),
+                        **segment_result,
+                    }
+                )
+                word_display_parts.append(word)
+                word_display_parts.append(f"/(...) {segment_result['ipa_text']} (...)/")
 
         full_result = run_inference(audio_data)
         full_result["segments"] = segments or None
-        full_result["segmented_ipa_text"] = "\n".join(display_parts) if display_parts else None
+        full_result["segmented_ipa_text"] = (
+            "\n".join(segment_display_parts) if segment_display_parts else None
+        )
+        full_result["words"] = words_payload
+        full_result["word_ipa_text"] = "\n".join(word_display_parts) if word_display_parts else None
         return full_result
 
     except HTTPException:
