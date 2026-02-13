@@ -28,11 +28,13 @@ pm = "pnpm"
 px = "pnpm dlx"
 gita = "git add ."
 gitc = "git commit -m"
-shadcn = "pnpm dlx shadcn-svelte@latest"
 
 [tasks.digest]
 description = "Generate digest.txt for LLMs to use, copy to clipboard"
 run = """
-gitingest --exclude-pattern .agent,src/renderer/lib,*.yaml,scripts/*,.github/*
+#!/bin/bash
+gitingest --exclude-pattern {{option(name="patterns")}},.agent,AGENTS.md,src/renderer/lib,*.yaml,scripts/*,.github/*
+agents="$(< AGENTS.md)\n"
+echo "$agents" | cat - digest.txt > temp && mv temp digest.txt
 cat digest.txt | pbcopy
 """

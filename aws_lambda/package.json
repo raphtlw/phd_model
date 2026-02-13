@@ -1,0 +1,14 @@
+{
+  "name": "wav2vec2-lambda-esm",
+  "version": "1.0.0",
+  "description": "Wav2Vec2 IPA Phoneme Recognition on AWS Lambda (ESM + SDK v3)",
+  "main": "index.js",
+  "type": "module",
+  "dependencies": {
+    "onnxruntime-node": "^1.23.2",
+    "wav-decoder": "^1.3.0"
+  },
+  "scripts": {
+    "test": "node local_test.js"
+  }
+}
